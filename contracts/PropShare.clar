@@ -10,10 +10,13 @@
 (define-constant err-invalid-amount (err u104))
 (define-constant err-property-inactive (err u105))
 (define-constant err-unauthorized (err u106))
+(define-constant err-no-shares (err u107))
+(define-constant err-already-distributed (err u108))
 
 ;; Data Variables
 (define-data-var next-property-id uint u1)
 (define-data-var platform-fee-percentage uint u250) ;; 2.5%
+(define-data-var next-distribution-id uint u1)
 
 ;; Data Maps
 (define-map properties
@@ -42,6 +45,21 @@
         property-type: (string-ascii 32),
         description: (string-ascii 256)
     }
+)
+
+(define-map rental-distributions
+    { property-id: uint, distribution-id: uint }
+    {
+        total-amount: uint,
+        amount-per-share: uint,
+        distributed-at: uint,
+        created-by: principal
+    }
+)
+
+(define-map user-claimed-distributions
+    { property-id: uint, distribution-id: uint, user: principal }
+    { claimed: bool }
 )
 
 ;; Private Functions
@@ -171,13 +189,108 @@
     (var-get platform-fee-percentage)
 )
 
-;; Update platform fee (owner only)
-(define-public (update-platform-fee (new-fee uint))
+;; Get next distribution ID
+(define-read-only (get-next-distribution-id)
+    (var-get next-distribution-id)
+)
+
+;; Get rental distribution information
+(define-read-only (get-rental-distribution (property-id uint) (distribution-id uint))
+    (if (and (> property-id u0) (> distribution-id u0))
+        (map-get? rental-distributions { property-id: property-id, distribution-id: distribution-id })
+        none
+    )
+)
+
+;; Check if user has claimed a distribution
+(define-read-only (has-claimed-distribution (property-id uint) (distribution-id uint) (user principal))
+    (if (and (> property-id u0) (> distribution-id u0))
+        (some (default-to false (get claimed (map-get? user-claimed-distributions { property-id: property-id, distribution-id: distribution-id, user: user }))))
+        none
+    )
+)
+
+;; Calculate claimable amount for a user
+(define-read-only (get-claimable-amount (property-id uint) (distribution-id uint) (user principal))
+    (let (
+        (user-shares-opt (map-get? user-shares { property-id: property-id, user: user }))
+        (distribution-opt (map-get? rental-distributions { property-id: property-id, distribution-id: distribution-id }))
+        (already-claimed (default-to false (get claimed (map-get? user-claimed-distributions { property-id: property-id, distribution-id: distribution-id, user: user }))))
+    )
+        (if (and (> property-id u0) (> distribution-id u0) (is-some user-shares-opt) (is-some distribution-opt) (not already-claimed))
+            (let (
+                (user-shares-val (get shares (unwrap-panic user-shares-opt)))
+                (amount-per-share (get amount-per-share (unwrap-panic distribution-opt)))
+            )
+                (some (* user-shares-val amount-per-share))
+            )
+            (some u0)
+        )
+    )
+)
+;; Update platform fee percentage (contract owner only)
+(define-public (set-platform-fee-percentage (new-fee uint))
     (begin
         (asserts! (is-contract-owner) err-owner-only)
         (asserts! (<= new-fee u1000) err-invalid-amount) ;; Max 10%
         (var-set platform-fee-percentage new-fee)
         (ok true)
+    )
+)
+
+;; Distribute rental income to shareholders
+(define-public (distribute-rental-income (property-id uint) (total-amount uint))
+    (let (
+        (property-data (unwrap! (map-get? properties { property-id: property-id }) err-not-found))
+        (distribution-id (var-get next-distribution-id))
+        (sold-shares (- (get total-shares property-data) (get available-shares property-data)))
+        (amount-per-share (if (> sold-shares u0) (/ total-amount sold-shares) u0))
+    )
+        (asserts! (> property-id u0) err-invalid-amount)
+        (asserts! (is-eq tx-sender (get owner property-data)) err-unauthorized)
+        (asserts! (> total-amount u0) err-invalid-amount)
+        (asserts! (> sold-shares u0) err-no-shares)
+        
+        ;; Record the distribution
+        (map-set rental-distributions
+            { property-id: property-id, distribution-id: distribution-id }
+            {
+                total-amount: total-amount,
+                amount-per-share: amount-per-share,
+                distributed-at: stacks-block-height,
+                created-by: tx-sender
+            }
+        )
+        
+        (var-set next-distribution-id (+ distribution-id u1))
+        (ok distribution-id)
+    )
+)
+
+;; Claim rental income distribution
+(define-public (claim-rental-income (property-id uint) (distribution-id uint))
+    (let (
+        (user-shares-amt (get shares (unwrap! (map-get? user-shares { property-id: property-id, user: tx-sender }) err-no-shares)))
+        (distribution-data (unwrap! (map-get? rental-distributions { property-id: property-id, distribution-id: distribution-id }) err-not-found))
+        (already-claimed (default-to false (get claimed (map-get? user-claimed-distributions { property-id: property-id, distribution-id: distribution-id, user: tx-sender }))))
+        (payout-amount (* user-shares-amt (get amount-per-share distribution-data)))
+    )
+        (asserts! (> property-id u0) err-invalid-amount)
+        (asserts! (> distribution-id u0) err-invalid-amount)
+        (asserts! (> user-shares-amt u0) err-no-shares)
+        (asserts! (not already-claimed) err-already-distributed)
+        (asserts! (> payout-amount u0) err-invalid-amount)
+        
+        ;; Transfer rental income to user
+        (try! (stx-transfer? payout-amount (get created-by distribution-data) tx-sender))
+        
+        ;; Mark as claimed
+        (map-set user-claimed-distributions
+            { property-id: property-id, distribution-id: distribution-id, user: tx-sender }
+            { claimed: true }
+        )
+        
+        (ok payout-amount)
     )
 )
 
