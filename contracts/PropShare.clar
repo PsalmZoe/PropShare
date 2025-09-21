@@ -12,11 +12,18 @@
 (define-constant err-unauthorized (err u106))
 (define-constant err-no-shares (err u107))
 (define-constant err-already-distributed (err u108))
+(define-constant err-contract-paused (err u109))
+(define-constant err-invalid-order (err u110))
+(define-constant err-order-not-found (err u111))
+(define-constant err-own-order (err u112))
+(define-constant err-insufficient-shares (err u113))
 
 ;; Data Variables
 (define-data-var next-property-id uint u1)
 (define-data-var platform-fee-percentage uint u250) ;; 2.5%
 (define-data-var next-distribution-id uint u1)
+(define-data-var contract-paused bool false)
+(define-data-var next-order-id uint u1)
 
 ;; Data Maps
 (define-map properties
@@ -62,12 +69,46 @@
     { claimed: bool }
 )
 
+;; Secondary Market Trading Maps
+(define-map sell-orders
+    { order-id: uint }
+    {
+        seller: principal,
+        property-id: uint,
+        shares-amount: uint,
+        price-per-share: uint,
+        is-active: bool,
+        created-at: uint
+    }
+)
+
 ;; Private Functions
 (define-private (is-contract-owner)
     (is-eq tx-sender contract-owner)
 )
 
+(define-private (assert-not-paused)
+    (ok (asserts! (not (var-get contract-paused)) err-contract-paused))
+)
+
 ;; Public Functions
+
+;; Emergency pause controls (contract owner only)
+(define-public (pause-contract)
+    (begin
+        (asserts! (is-contract-owner) err-owner-only)
+        (var-set contract-paused true)
+        (ok true)
+    )
+)
+
+(define-public (unpause-contract)
+    (begin
+        (asserts! (is-contract-owner) err-owner-only)
+        (var-set contract-paused false)
+        (ok true)
+    )
+)
 
 ;; Create a new property listing
 (define-public (create-property 
@@ -82,6 +123,7 @@
         (property-id (var-get next-property-id))
         (price-per-share (/ total-value total-shares))
     )
+        (try! (assert-not-paused))
         (asserts! (> total-value u0) err-invalid-amount)
         (asserts! (> total-shares u0) err-invalid-amount)
         (asserts! (> (len name) u0) err-invalid-amount)
@@ -126,6 +168,7 @@
         (platform-fee (/ (* total-cost (var-get platform-fee-percentage)) u10000))
         (seller-amount (- total-cost platform-fee))
     )
+        (try! (assert-not-paused))
         (asserts! (> property-id u0) err-invalid-amount)
         (asserts! (get is-active property-data) err-property-inactive)
         (asserts! (>= (get available-shares property-data) shares-to-buy) err-insufficient-funds)
@@ -155,6 +198,106 @@
     )
 )
 
+;; Secondary Market: Create sell order
+(define-public (create-sell-order (property-id uint) (shares-amount uint) (price-per-share uint))
+    (let (
+        (order-id (var-get next-order-id))
+        (user-shares-data (map-get? user-shares { property-id: property-id, user: tx-sender }))
+        (current-shares (default-to u0 (get shares user-shares-data)))
+    )
+        (try! (assert-not-paused))
+        (asserts! (> property-id u0) err-invalid-amount)
+        (asserts! (> shares-amount u0) err-invalid-amount)
+        (asserts! (> price-per-share u0) err-invalid-amount)
+        (asserts! (is-some (map-get? properties { property-id: property-id })) err-not-found)
+        (asserts! (>= current-shares shares-amount) err-insufficient-shares)
+        
+        ;; Create sell order
+        (map-set sell-orders
+            { order-id: order-id }
+            {
+                seller: tx-sender,
+                property-id: property-id,
+                shares-amount: shares-amount,
+                price-per-share: price-per-share,
+                is-active: true,
+                created-at: stacks-block-height
+            }
+        )
+        
+        (var-set next-order-id (+ order-id u1))
+        (ok order-id)
+    )
+)
+
+;; Secondary Market: Buy from sell order
+(define-public (buy-from-order (order-id uint))
+    (let (
+        (order-data (unwrap! (map-get? sell-orders { order-id: order-id }) err-order-not-found))
+        (seller (get seller order-data))
+        (property-id (get property-id order-data))
+        (shares-amount (get shares-amount order-data))
+        (price-per-share (get price-per-share order-data))
+        (total-cost (* shares-amount price-per-share))
+        (platform-fee (/ (* total-cost (var-get platform-fee-percentage)) u10000))
+        (seller-amount (- total-cost platform-fee))
+        (seller-shares (default-to u0 (get shares (map-get? user-shares { property-id: property-id, user: seller }))))
+        (buyer-shares (default-to u0 (get shares (map-get? user-shares { property-id: property-id, user: tx-sender }))))
+    )
+        (try! (assert-not-paused))
+        (asserts! (> order-id u0) err-invalid-amount)
+        (asserts! (get is-active order-data) err-invalid-order)
+        (asserts! (not (is-eq tx-sender seller)) err-own-order)
+        (asserts! (>= seller-shares shares-amount) err-insufficient-shares)
+        
+        ;; Transfer STX from buyer to seller
+        (try! (stx-transfer? seller-amount tx-sender seller))
+        
+        ;; Transfer platform fee to contract owner
+        (try! (stx-transfer? platform-fee tx-sender contract-owner))
+        
+        ;; Update seller shares
+        (map-set user-shares
+            { property-id: property-id, user: seller }
+            { shares: (- seller-shares shares-amount) }
+        )
+        
+        ;; Update buyer shares
+        (map-set user-shares
+            { property-id: property-id, user: tx-sender }
+            { shares: (+ buyer-shares shares-amount) }
+        )
+        
+        ;; Deactivate the sell order
+        (map-set sell-orders
+            { order-id: order-id }
+            (merge order-data { is-active: false })
+        )
+        
+        (ok shares-amount)
+    )
+)
+
+;; Cancel sell order
+(define-public (cancel-sell-order (order-id uint))
+    (let (
+        (order-data (unwrap! (map-get? sell-orders { order-id: order-id }) err-order-not-found))
+    )
+        (try! (assert-not-paused))
+        (asserts! (> order-id u0) err-invalid-amount)
+        (asserts! (is-eq tx-sender (get seller order-data)) err-unauthorized)
+        (asserts! (get is-active order-data) err-invalid-order)
+        
+        ;; Deactivate the sell order
+        (map-set sell-orders
+            { order-id: order-id }
+            (merge order-data { is-active: false })
+        )
+        
+        (ok true)
+    )
+)
+
 ;; Get property information
 (define-read-only (get-property (property-id uint))
     (if (> property-id u0)
@@ -179,6 +322,19 @@
     )
 )
 
+;; Get sell order information
+(define-read-only (get-sell-order (order-id uint))
+    (if (> order-id u0)
+        (map-get? sell-orders { order-id: order-id })
+        none
+    )
+)
+
+;; Get contract pause status
+(define-read-only (get-contract-paused)
+    (var-get contract-paused)
+)
+
 ;; Get next property ID
 (define-read-only (get-next-property-id)
     (var-get next-property-id)
@@ -192,6 +348,11 @@
 ;; Get next distribution ID
 (define-read-only (get-next-distribution-id)
     (var-get next-distribution-id)
+)
+
+;; Get next order ID
+(define-read-only (get-next-order-id)
+    (var-get next-order-id)
 )
 
 ;; Get rental distribution information
@@ -228,6 +389,7 @@
         )
     )
 )
+
 ;; Update platform fee percentage (contract owner only)
 (define-public (set-platform-fee-percentage (new-fee uint))
     (begin
@@ -246,6 +408,7 @@
         (sold-shares (- (get total-shares property-data) (get available-shares property-data)))
         (amount-per-share (if (> sold-shares u0) (/ total-amount sold-shares) u0))
     )
+        (try! (assert-not-paused))
         (asserts! (> property-id u0) err-invalid-amount)
         (asserts! (is-eq tx-sender (get owner property-data)) err-unauthorized)
         (asserts! (> total-amount u0) err-invalid-amount)
@@ -275,6 +438,7 @@
         (already-claimed (default-to false (get claimed (map-get? user-claimed-distributions { property-id: property-id, distribution-id: distribution-id, user: tx-sender }))))
         (payout-amount (* user-shares-amt (get amount-per-share distribution-data)))
     )
+        (try! (assert-not-paused))
         (asserts! (> property-id u0) err-invalid-amount)
         (asserts! (> distribution-id u0) err-invalid-amount)
         (asserts! (> user-shares-amt u0) err-no-shares)
@@ -299,6 +463,7 @@
     (let (
         (property-data (unwrap! (map-get? properties { property-id: property-id }) err-not-found))
     )
+        (try! (assert-not-paused))
         (asserts! (> property-id u0) err-invalid-amount)
         (asserts! (is-eq tx-sender (get owner property-data)) err-unauthorized)
         
